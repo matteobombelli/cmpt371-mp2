@@ -1,8 +1,10 @@
 import prtp
 
+server_ip = "127.0.0.1"
+server_port = 8080
 local_ip = "127.0.0.1"
-local_port = 8080
+local_port = 8081
 
-connection = prtp.PRTP_sender(local_ip, local_port)
+client = prtp.PRTP_client(server_ip, server_port, local_ip, local_port)
 
-connection.send("Hello World!")
+client.run()

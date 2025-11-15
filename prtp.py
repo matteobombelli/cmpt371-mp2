@@ -1,6 +1,7 @@
 import socket
 from enum import Enum, auto
 import math
+import time
 
 class Connection_Status(Enum):
     NEW = auto()
@@ -29,17 +30,17 @@ class PRTP_Header:
         # Seq. #: int
     
     def __init__(self, 
-        req=False, 
+        con=False, 
         acc=False,
         fin=False):
-        if req:
+        if con:
             self.bytestream = 0b100
         if acc:
             self.bytestream = 0b010
         if fin:
             self.bytestream = 0b001
-
-    def get_REQ(self):
+            
+    def get_CON(self):
         return self.bytestream & 0b100
     
     def get_ACC(self):
@@ -49,12 +50,11 @@ class PRTP_Header:
         return self.bytestream & 0b001
 
 
-class PRTP_receiver:
+class PRTP_server:
     def __init__(self, ip, port):
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.buffer = 1024
-        self.ip = ip
-        self.port = port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.buffer = 4096 # Maximum PRTP segment size
+        self.address = (ip, port)
         self.connections = {}
 
     def _parse_header(self, payload):
@@ -67,66 +67,90 @@ class PRTP_receiver:
             newPRTPConnection = PRTP_Connection(address)
             self.connections[address] = newPRTPConnection
             new_header = PRTP_Header(acc=True)
-            self.respond(new_header.bytestream, 0b0, address)
+            self.send(new_header.bytestream, 0b0, address)
 
-    def _handle_datagram(self, payload, connection):
+    def _handle_datagram(self, payload, connection): # TODO: Expand on this (or replace?)
         print(payload)
         print(connection)
 
-    def respond(self, header, payload, address):
-        header_bytes = header.to_bytes()
-        payload_bytes = payload.to_bytes()
-        self.socket.sendto(header_bytes + payload_bytes, address)
+    def send(self, header, payload, address):
+    # Sends a PRTP packet with the given header and payload to the given address
+        header_bytes = header.to_bytes()   # TODO: Come back to this - are we doing this right?
+        payload_bytes = payload.to_bytes() # TODO: Come back to this - are we doing this right?
+        self.sock.sendto(header_bytes + payload_bytes, address)
 
-    def listen(self):
-        self.socket.bind((self.ip, self.port))
-        self.socket.setblocking(False)
+    def run(self):
+    # Handles server responsibilities
+        # Initialize socket
+        self.sock.bind(self.address)
+        self.sock.setblocking(False)
 
         while True:
             try:
-                datagram = self.socket.recvfrom(self.buffer)
+                datagram = self.sock.recvfrom(self.buffer)
                 payload = datagram[0]
                 address = datagram[1]
                 if address in self.connections:
+                    print(f"Existing connection: {address}")
                     self._handle_datagram(payload, (self.connections.get(address)))
                 else:
                     # TODO: Check requesting connection
+                    print(f"New connection: {address}")
                     self._handle_connection(payload, address)
             except BlockingIOError:
                 pass
 
-
-class PRTP_sender:
+class PRTP_client:
     def __init__(self, send_ip, send_port, receive_ip, receive_port):
-        self.send_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.receive_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.send_ip = send_ip
-        self.send_port = send_port
-        self.receive_ip = receive_ip
-        self.receive_port = receive_port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.buffer = 4096 # Maximum PRTP segment size
+        self.send_address = (send_ip, send_port)
+        self.receive_address = (receive_ip, receive_port)
     
-    def listen(self):
-        # Send request to server
-        self.send()
+    def run(self):
+    # Handles client responsibilities
+        # Initialize socket
+        self.sock.bind(self.receive_address)
 
+        # Send connection request to server
+        self.connect()
+        datagram = self.receive()
+        if datagram:
+            # TODO: Check whether this message is an "Accept_Connection" message. (We are just assuming rn.)
+            print(datagram)
+        else:
+            print("Connection request not reciprocated... closing client...")
+            return
+
+        # Connection accepted
+        # TODO: Handle subsequent packets from server + handle ACKs
+        self.send(0, "Hello World!", self.send_address) # This is just a test message...
+        datagram = self.receive()
+        print(datagram)
+
+    def connect(self): #TODO: We can probably replace this just with send()
+        new_header = PRTP_Header(con=True)
+        self.sock.sendto(new_header.bytestream.to_bytes(), self.send_address)
+        
+    def send(self, header, payload, address):
+    # Sends a PRTP packet with the given header and payload to the given address
+        header_bytes = header.to_bytes() # TODO: Come back to this - are we doing this right?
+        payload_bytes = payload.encode() # TODO: Come back to this - are we doing this right?
+        self.sock.sendto(header_bytes + payload_bytes, address)
+
+    def receive(self):
+    # Receive segments and handle them appropriately
         # Wait for accept
-        self.socket.bind((self.receive_ip, self.receive_port))
-
-        while True:
-            datagram = self.socket.recvfrom(self.buffer)
+        timer = 10000 # TODO: Implement RTT based timer. Fuse with pipeline functionality.
+        while timer:
+            datagram = self.sock.recvfrom(self.buffer)
+            print(f"Message received")
+            # TODO: Utilize checksum
             payload = datagram[0]
             address = datagram[1]
-            if address == (self.send_ip, self.send_port):
-            
-            # Check we received accept
-            # If accept, break this loop
-            # Otherwise, return (close connection)
-            # TODO: timeout
-
-        print("Successfully connected!")
-        # while True:
-            # Main loop for receiving packets and sending ACKs
-
-    def send(self):
-        new_header = PRTP_Header(req=True)
-        self.send_socket.sendto(new_header.bytestream.to_bytes(), (self.ip, self.port))
+            if address == self.send_address:
+                return datagram
+            timer-=1
+        if not timer:
+            print("Timeout...")
+            return
