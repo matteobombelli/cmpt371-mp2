@@ -30,6 +30,7 @@ class PRTP_Header:
             - F Flag: Aka FIN, signals the packet is closing a connection or
                       is the last packet in transmitting a resource
             - 0s: 5 bits of reserved padding to maintain header byte alignment
+        - Checksum: An 8 bit number indicating the PRTP segment checksum.
         - SEQ: A 16 bit number indicating the starting byte for the segment 
                data payload
         - ACK: A 16 bit number indicating the last acknowledged byte received 
@@ -37,7 +38,6 @@ class PRTP_Header:
         - REC: A 16 bit number indicating the maximum segment size that can
                be sent to a receiver
         - LEN: A 16 bit number indicating the size of the data payload in bytes.
-        - Checksum: An 8 bit number indicating the PRTP segment checksum.
 
         Header Bytestream Diagram:
          CAF00000 00000000 0000000000000000 0000000000000000 0000000000000000 0000000000000000
@@ -98,8 +98,8 @@ class PRTP_Header:
         con = flags&cls.Flags.CON
         acc = flags&cls.Flags.ACC
         fin = flags&cls.Flags.FIN
-        check = int.from_bytes(bytes[cls.LEN_END:cls.CHECK_END])
-        seq   = int.from_bytes(bytes[cls.FLAGS_END:cls.SEQ_END])
+        check = int.from_bytes(bytes[cls.FLAGS_END:cls.CHECK_END])
+        seq   = int.from_bytes(bytes[cls.CHECK_END:cls.SEQ_END])
         ack   = int.from_bytes(bytes[cls.SEQ_END:cls.ACK_END])
         rec   = int.from_bytes(bytes[cls.ACK_END:cls.REC_END])
         len   = int.from_bytes(bytes[cls.REC_END:cls.LEN_END])
@@ -285,7 +285,6 @@ class PRTP_client:
         timeout = 10000 # TODO: Choose a more suitable connection request timeout value
         while timeout and self.sock.connections[self.send_address].status is not PRTP_Connection.Status.CONNECTED:
             address = self.sock.receive()
-            if address: print(f"Message received from {address}...")
             timeout-=1
         
         # Wait for handshake
@@ -294,7 +293,6 @@ class PRTP_client:
             return
 
         # Connection accepted - time to talk
-        #segment = self.sock.create_segment(0,0,0,"Hello, World!".encode()) # This is just a test message...
         self.sock.send("Hello, World!".encode(), self.send_address) 
         while not self.sock.receive(): continue
         segment = self.sock.connections[self.send_address].messages.popleft()
