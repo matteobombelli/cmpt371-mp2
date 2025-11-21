@@ -128,7 +128,7 @@ class PRTP_socket:
         self.address = address
         self.connections = {} # Maps (ip,port):PRTP_Connection key-value pairs
 
-    def _create_segment(self, flags=0b000, seq=0, ack=0, payload=None):
+    def _create_segment(self, flags=0b000, seq=0, ack=0, rec=0, payload=None):
         """
             Creates a PRTP segment in bytes form with a valid header and 
             payload. The payload must be passed in as a bytes object.
@@ -137,13 +137,13 @@ class PRTP_socket:
         """
         if payload:
             length = len(payload)
-            header = PRTP_Header(flags, seq, ack, length)
+            header = PRTP_Header(flags, seq, ack, rec, length)
             # checksum = self.calculate_checksum(header)
             # header.bytes[header.FLAGS_END:header.CHECK_END] = checksum
             # header.check = checksum
             return header.bytes + payload
         else:
-            header = PRTP_Header(flags,seq,ack,0)
+            header = PRTP_Header(flags, seq, ack, rec, 0)
             # checksum = self.calculate_checksum(header)
             # header.bytes[header.FLAGS_END:header.CHECK_END] = checksum
             # header.check = checksum
@@ -194,7 +194,7 @@ class PRTP_socket:
                 print(f"Receiving connection request from {address}...")
                 self.connections[address] = PRTP_Connection()
                 response = self._create_segment(PRTP_Header.Flags.ACC)
-                self.send(response, address)
+                self._sock.sendto(response, address)
                 return None
             
     # def _calculate_checksum(self, header):
@@ -215,7 +215,8 @@ class PRTP_socket:
             print(f"Connecting to {address}...")
             self.connections[address] = PRTP_Connection()
             segment = self._create_segment(PRTP_Header.Flags.CON)
-            self.send(segment, address)
+            print(f"Sending {bin(int.from_bytes(segment))} to {address}...")
+            self._sock.sendto(segment, address)
             return True
     
     def disconnect(self, address):
@@ -224,7 +225,7 @@ class PRTP_socket:
         """
         if address in self.connections:
             segment = self._create_segment(PRTP_Header.Flags.FIN)
-            self.send(segment, address)
+            self._sock.sendto(segment, address)
             del self.connections[address]
 
     def send(self, payload, address):
@@ -284,6 +285,7 @@ class PRTP_client:
         timeout = 10000 # TODO: Choose a more suitable connection request timeout value
         while timeout and self.sock.connections[self.send_address].status is not PRTP_Connection.Status.CONNECTED:
             address = self.sock.receive()
+            if address: print(f"Message received from {address}...")
             timeout-=1
         
         # Wait for handshake
