@@ -17,12 +17,12 @@ class Connection:
     def __init__(self, status=Status.REQUESTED):
         self.status = status
         self.messages = deque()
+        self.window = deque() # Holds [header, segment, transmission_time] pairs
         self.last_time = time.time()
         self.timeout = 0
         self.eRTT = 1 # TODO: Might want to give a better initial value
         self.dRTT = 0
         # self.max_messages = ... <- We might want to limit the message queue?
-        # self.window = ... <- This will likely hold a lot of data
 
     def update_timeout(self):
         """
@@ -246,6 +246,7 @@ class PRTP_socket:
                 # Handle checksum
                 if not self._compare_checksum(header, payload):
                     # TODO: Send previous ACK (based on pipeline)
+                    ack = self._create_segment(Header.Flags.ACK, 0, 0, 0)
                     print(f"{time.ctime()} - Incoming segment checksum fail...")
                     return None
 
@@ -271,7 +272,7 @@ class PRTP_socket:
         for byte in header.bytes[:Header.FLAGS_END]: check += byte
         for byte in header.bytes[Header.CHECK_END:]: check += byte
         if payload: 
-            for byte in payload:                          check += byte
+            for byte in payload:                     check += byte
         while (check >> 8): check = (check & CHECK_BITS) + (check >> 8)
 
         return check ^ CHECK_BITS
@@ -337,13 +338,7 @@ class PRTP_socket:
         """
         try:
             (segment, address) = self._sock.recvfrom(PRTP_MAX_SEGMENT_SIZE)
-            receive_address = self._handle_incoming_segment(segment, address)
-            if (receive_address in self.connections 
-                and (conn:=self.connections[receive_address]).status == Connection.Status.CLOSING
-                and not conn.messages):
-                del self.connections[receive_address]
-                print(f"{time.ctime()} - Connection {receive_address} termination has been finalized.")
-            return receive_address
+            return self._handle_incoming_segment(segment, address)
         except BlockingIOError:
             return None
         
