@@ -22,7 +22,7 @@ class Connection:
         self.last_time = time.time()
 
         # Reliability
-        self.timeout = 2.0
+        self.timeout = 1
         self.eRTT = 1 # TODO: Might want to give a better initial value
         self.dRTT = 0
         # self.max_messages = ... <- We might want to limit the message queue?
