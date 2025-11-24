@@ -6,8 +6,8 @@ import time
 
 PRTP_MAX_SEGMENT_SIZE = (2**16) - 1 # 16 bit segment size space for byte alignment
 MSS = 1024
-MAX_BUFFER_SIZE = (2**16) - 1
 SEQ_SPACE = 2**16
+MAX_BUFFER_SIZE = SEQ_SPACE // 2
 
 class Connection:
     class Status(Enum):
@@ -43,7 +43,7 @@ class Connection:
 
         # Congestion Control
         self.cwnd = MSS * 2
-        self.ssthresh = 32 * 1024
+        self.in_slow_start = True
         self.dup_acks = 0
 
         # Buffers
@@ -52,23 +52,23 @@ class Connection:
         self.out_q = deque()
 
     def update_timeout(self):
-            """
-                Updates the timeout value based on running weighed RTT average.
-                This should be run on receipt of valid ACKs.
-            """
-            if self.send_base in self.sent_buffer:
-                entry = self.sent_buffer[self.send_base]
-                
-                if entry.get('retransmitted', False):
-                    return
+        """
+            Updates the timeout value based on running weighed RTT average.
+            This should be run on receipt of valid ACKs.
+        """
+        if self.send_base in self.sent_buffer:
+            entry = self.sent_buffer[self.send_base]
+            
+            if entry.get('retransmitted', False):
+                return
 
-                a = 0.125
-                b = 0.25
-                sRTT = time.time() - entry['time']
-                self.eRTT = (1-a)*self.eRTT + a*sRTT
-                self.dRTT = (1-b)*self.dRTT + b*abs(sRTT - self.eRTT)
-                self.timeout = self.eRTT + 4*self.dRTT
-            print(f"eRTT: {self.eRTT}, dRTT: {self.dRTT}, timeout: {self.timeout}")
+            a = 0.125
+            b = 0.25
+            sRTT = time.time() - entry['time']
+            self.eRTT = (1-a)*self.eRTT + a*sRTT
+            self.dRTT = (1-b)*self.dRTT + b*abs(sRTT - self.eRTT)
+            self.timeout = self.eRTT + 4*self.dRTT
+        print(f"eRTT: {self.eRTT}, dRTT: {self.dRTT}, timeout: {self.timeout}")
 
 class Header:
     """
@@ -265,6 +265,8 @@ class PRTP_socket:
                     conn.status = Connection.Status.ESTABLISHED
                     conn.send_base = header.ack
                     conn.next_seq_num = header.ack
+                    conn.recv_base = (header.seq + 1) % SEQ_SPACE 
+
                     if 0 in conn.sent_buffer:
                         del conn.sent_buffer[0]
                     ack = self._create_segment(Messages.ACK, conn.next_seq_num, conn.recv_base)
@@ -290,7 +292,7 @@ class PRTP_socket:
                     conn.close_timer = time.time()
 
             elif header.flags == Messages.ACK:
-                if conn.status == Connection.Status.CLOSING_LAST_ACK and header.Flags == Messages.FIN_ACK:
+                if conn.status == Connection.Status.CLOSING_LAST_ACK and header.flags == Messages.FIN_ACK:
                     del self.connections[address]
                     return None
 
@@ -301,12 +303,15 @@ class PRTP_socket:
                 # If distance from send_base to ack_num is positive and small
                 diff = self._seq_diff(ack_num, conn.send_base)
                 if diff > 0 and diff < SEQ_SPACE / 2: # Valid new ACK
-                    
                     conn.update_timeout()
+                    conn.dup_acks = 0
 
                     print(f"ACK {ack_num} received. Sliding window.")
-                    conn.cwnd += MSS * (MSS / conn.cwnd) if conn.cwnd > 0 else MSS
-                    conn.dup_acks = 0
+
+                    if conn.in_slow_start:
+                        conn.cwnd += MSS if conn.cwnd > 0 else MSS
+                    else:
+                        conn.cwnd += MSS * (MSS / conn.cwnd) if conn.cwnd > 0 else MSS
 
                     # Slide window
                     # Remove everything 'behind' ack_num in the circular buffer
@@ -328,8 +333,9 @@ class PRTP_socket:
                         print(f"Triple duplicate ACK for {ack_num}. Fast Retransmit!")
                         if conn.send_base in conn.sent_buffer:
                             self._sock.sendto(conn.sent_buffer[conn.send_base]['seg'], address)
-                        conn.ssthresh = max(conn.cwnd // 2, 2 * MSS)
-                        conn.cwnd = conn.ssthresh + 3 * MSS
+
+                        conn.in_slow_start = False
+                        conn.cwnd = max(MSS, conn.cwnd // 2)
 
                 if conn.status == Connection.Status.RECEIVED:
                     conn.status = Connection.Status.ESTABLISHED
@@ -368,6 +374,10 @@ class PRTP_socket:
                 print(f"{time.time()} - {self.address}: Connection request received from {address}...")
                 conn = Connection(Connection.Status.RECEIVED)
                 conn.recv_base = (header.seq + 1) % SEQ_SPACE
+                
+                conn.send_base = 100
+                conn.next_seq_num = 101 # 100 + 1 for SYN (implied)
+                
                 self.connections[address] = conn 
                 response = self._create_segment(Messages.CON_ACC, seq=100, ack=conn.recv_base)
                 self._sock.sendto(response, address)
@@ -378,6 +388,25 @@ class PRTP_socket:
     def _seq_diff(self, a, b):
         """Returns the distance from b to a (a - b) in a circular space"""
         return (a - b) % SEQ_SPACE
+
+    def check_timers(self, conn, address):
+        if not conn.sent_buffer: return
+
+        current_time = time.time()
+        # Check oldest unacked
+        if conn.send_base in conn.sent_buffer:
+            entry = conn.sent_buffer[conn.send_base]
+            if current_time - entry['time'] > conn.timeout:
+                print(f"{time.ctime()} - Timeout detected for Seq {conn.send_base}. Retransmitting...")
+                self._sock.sendto(entry['seg'], address)
+                
+                entry['time'] = current_time 
+                entry['retransmitted'] = True
+                
+                # Congestion Control: Collapse CWND on timeout
+                conn.in_slow_start = False
+                conn.cwnd = max(MSS, conn.cwnd // 2)
+                conn.dup_acks = 0
 
     def _calculate_checksum(self, header, payload=None):
         """
@@ -492,9 +521,15 @@ class PRTP_socket:
             }
 
             self._sock.sendto(segment, address)
-            
             conn.next_seq_num = (conn.next_seq_num + 1) % SEQ_SPACE
             
+            start_wait = time.time()
+            while conn.status != Connection.Status.ESTABLISHED:
+                self.receive()
+                if time.time() - start_wait > 5: # Hard timeout for handshake
+                    return False
+                time.sleep(0.01)
+
             return True
     
     def disconnect(self, address):
@@ -515,6 +550,7 @@ class PRTP_socket:
 
             data_chunks = [payload[i:i+MSS] for i in range(0, len(payload), MSS)]
             total_chunks = len(data_chunks)
+            last_probe = time.time() # For Zero Window Probing
             
             print(f"Sending {len(payload)} bytes in {total_chunks} chunks.")
 
