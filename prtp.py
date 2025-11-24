@@ -46,17 +46,23 @@ class Connection:
         self.recv_buffer = {}
 
     def update_timeout(self):
-        """
-            Updates the timeout value based on running weighed RTT average.
-            This should be run on receipt of every ACK and CON|ACK.
-        """
-        a = 0.125
-        b = 0.25
-        sRTT = time.time() - self.last_time
-        self.eRTT = (1-a)*self.eRTT + a*sRTT
-        self.dRTT = (1-b)*self.dRTT + b*abs(sRTT - self.eRTT)
-        self.timeout = self.eRTT + 4*self.dRTT
-        # print(f"eRTT: {self.eRTT}, dRTT: {self.dRTT}, timeout: {self.timeout}")
+            """
+                Updates the timeout value based on running weighed RTT average.
+                This should be run on receipt of valid ACKs.
+            """
+            if self.send_base in self.sent_buffer:
+                entry = self.sent_buffer[self.send_base]
+                
+                if entry.get('retransmitted', False):
+                    return
+
+                a = 0.125
+                b = 0.25
+                sRTT = time.time() - entry['time']
+                self.eRTT = (1-a)*self.eRTT + a*sRTT
+                self.dRTT = (1-b)*self.dRTT + b*abs(sRTT - self.eRTT)
+                self.timeout = self.eRTT + 4*self.dRTT
+            print(f"eRTT: {self.eRTT}, dRTT: {self.dRTT}, timeout: {self.timeout}")
 
 class Header:
     """
@@ -219,9 +225,6 @@ class PRTP_socket:
 
             if not self._compare_checksum(header, payload):
                 return None
-            
-            if header.flags & Header.Flags.ACK:
-                 conn.update_timeout()
 
             if header.flags & Header.Flags.CON:
                 if header.flags == Header.Flags.CON:
@@ -247,6 +250,9 @@ class PRTP_socket:
                 # If distance from send_base to ack_num is positive and small
                 diff = self._seq_diff(ack_num, conn.send_base)
                 if diff > 0 and diff < SEQ_SPACE / 2: # Valid new ACK
+                    
+                    conn.update_timeout()
+
                     print(f"ACK {ack_num} received. Sliding window.")
                     conn.cwnd += MSS * (MSS / conn.cwnd) if conn.cwnd > 0 else MSS
                     conn.dup_acks = 0
@@ -333,7 +339,9 @@ class PRTP_socket:
             if current_time - entry['time'] > conn.timeout:
                 print(f"{time.ctime()} - Timeout detected for Seq {conn.send_base}. Retransmitting...")
                 self._sock.sendto(entry['seg'], address)
+                
                 entry['time'] = current_time 
+                entry['retransmitted'] = True
                 
                 # Congestion Control: Collapse CWND on timeout
                 conn.ssthresh = max(conn.cwnd // 2, 2 * MSS)
@@ -363,27 +371,31 @@ class PRTP_socket:
         return calc == header.check
     
     def connect(self, address):
-        """
-            Request a PRTP connection with the host at the provided address.
-            This method should be called externally as part of a running client
-            or server.
-        """
-        if address in self.connections: return False
-        
-        print(f"{time.ctime()} - Connecting to {address}...")
-        self.connections[address] = Connection(Connection.Status.REQUESTED)
-        conn = self.connections[address]
-        
-        segment = self._create_segment(Header.Flags.CON, seq=0)
-        
-        conn.sent_buffer[0] = {
-            'data': b'', 
-            'time': time.time(), 
-            'seg': segment
-        }
+            """
+                Request a PRTP connection with the host at the provided address.
+                This method should be called externally as part of a running client
+                or server.
+            """
+            if address in self.connections: return False
+            
+            print(f"{time.ctime()} - Connecting to {address}...")
+            self.connections[address] = Connection(Connection.Status.REQUESTED)
+            conn = self.connections[address]
+            
+            # Initial CON segment always starts at sequence 0
+            segment = self._create_segment(Header.Flags.CON, seq=0)
+            
+            conn.sent_buffer[0] = {
+                'data': b'', 
+                'time': time.time(), 
+                'seg': segment
+            }
 
-        self._sock.sendto(segment, address)
-        return True
+            self._sock.sendto(segment, address)
+            
+            conn.next_seq_num = (conn.next_seq_num + 1) % SEQ_SPACE
+            
+            return True
     
     def disconnect(self, address):
         """
@@ -464,18 +476,21 @@ class PRTP_socket:
         return None
         
     def get_segment(self, address):
-        """
-            Gets the first incoming message in the queue for the provided
-            address as long as there is an active connection with it.
-        """
         if address in self.connections and (conn := self.connections[address]).messages:
+            # Check if window was effectively closed before we consume data
+            was_full = (MAX_BUFFER_SIZE - (sum(len(m) for m in conn.messages))) < MSS
+            
             message = conn.messages.popleft()
-            if conn.status == Connection.Status.CLOSING and not conn.messages:
-                # Terminate closing connection on empty message queue
-                del self.connections[address]
+            
+            if was_full:
+                current_buffer_usage = sum(len(m) for m in conn.messages) + len(conn.recv_buffer) * MSS
+                new_rwnd = max(0, MAX_BUFFER_SIZE - current_buffer_usage)
+                # Send Window Update
+                update = self._create_segment(Header.Flags.ACK, 0, conn.recv_base, new_rwnd)
+                self._sock.sendto(update, address)
+                
             return message
-        else: 
-            return None
+        return None
 
 class PRTP_server:
     def __init__(self, ip, port):
