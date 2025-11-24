@@ -5,28 +5,32 @@ import time
 
 PRTP_MAX_SEGMENT_SIZE = (2**16) - 1 # 16 bit segment size space for byte alignment
 MSS = 1024
-MAX_BUFFER_SIZE = (2**16) - 1
 SEQ_SPACE = 2**16
+MAX_BUFFER_SIZE = SEQ_SPACE // 2
 
 class Connection:
     class Status(Enum):
         REQUESTED = auto()
         RECEIVED = auto()
         ESTABLISHED = auto()
-        CLOSING = auto()
-        # TIMEOUT = auto()
+        CLOSING_INIT_1 = auto()
+        CLOSING_INIT_2 = auto()
+        CLOSING_TIMED_WAIT = auto()
+        CLOSING_RECEIVED = auto()
+        CLOSING_LAST_ACK = auto()
+
+    MAX_SEGMENT_LIFETIME = 60 # 60 second lifetime.
 
     def __init__(self, status=Status.REQUESTED):
         self.status = status
         self.messages = deque()
         self.last_time = time.time()
+        self.close_timer = 0
 
         # Reliability
         self.timeout = 1
         self.eRTT = 1 # TODO: Might want to give a better initial value
         self.dRTT = 0
-        # self.max_messages = ... <- We might want to limit the message queue?
-        # self.window = ... <- This will likely hold a lot of data
 
         # Pipelining
         self.send_base = 0
@@ -38,7 +42,7 @@ class Connection:
 
         # Congestion Control
         self.cwnd = MSS * 2
-        self.ssthresh = 32 * 1024
+        self.in_slow_start = True
         self.dup_acks = 0
 
         # Buffers
@@ -48,15 +52,21 @@ class Connection:
     def update_timeout(self):
         """
             Updates the timeout value based on running weighed RTT average.
-            This should be run on receipt of every ACK and CON|ACK.
+            This should be run on receipt of valid ACKs.
         """
-        a = 0.125
-        b = 0.25
-        sRTT = time.time() - self.last_time
-        self.eRTT = (1-a)*self.eRTT + a*sRTT
-        self.dRTT = (1-b)*self.dRTT + b*abs(sRTT - self.eRTT)
-        self.timeout = self.eRTT + 4*self.dRTT
-        # print(f"eRTT: {self.eRTT}, dRTT: {self.dRTT}, timeout: {self.timeout}")
+        if self.send_base in self.sent_buffer:
+            entry = self.sent_buffer[self.send_base]
+            
+            if entry.get('retransmitted', False):
+                return
+
+            a = 0.125
+            b = 0.25
+            sRTT = time.time() - entry['time']
+            self.eRTT = (1-a)*self.eRTT + a*sRTT
+            self.dRTT = (1-b)*self.dRTT + b*abs(sRTT - self.eRTT)
+            self.timeout = self.eRTT + 4*self.dRTT
+        print(f"eRTT: {self.eRTT}, dRTT: {self.dRTT}, timeout: {self.timeout}")
 
 class Header:
     """
@@ -150,6 +160,19 @@ class Header:
         header.check = check
         header.bytes = bytes
         return header
+
+class Messages:
+    """
+        PRTP Messages are defined by combinations of their header flag bits.
+    """
+    CON_REQ = Header.Flags.CON                    # Request_Connection
+    CON_ACC = Header.Flags.CON | Header.Flags.ACK # Accept_Connection
+    CON_RES = Header.Flags.CON | Header.Flags.RES # Reset_Connection
+    CON_CLO = Header.Flags.CON | Header.Flags.FIN # Close_Connection
+    CLO_ACK = Header.Flags.CON | Header.Flags.FIN | Header.Flags.ACK # Acknowledge_Close_Connection
+    ACK = Header.Flags.ACK                        # Acknowledgment
+    FIN = Header.Flags.FIN                        # Final_Segment
+    FIN_ACK = Header.Flags.FIN | Header.Flags.ACK # Final_Ack
     
 class PRTP_socket:
     """
@@ -212,31 +235,48 @@ class PRTP_socket:
             passes checksum matching).
         """
         (header, payload) = self._decompose_segment(segment)
+        receive_address = None
         
         if address in self.connections:
             conn = self.connections[address]
-            receive_address = None
 
             if not self._compare_checksum(header, payload):
                 return None
-            
-            if header.flags & Header.Flags.ACK:
-                 conn.update_timeout()
 
-            if header.flags & Header.Flags.CON:
-                if header.flags & Header.Flags.ACK:
-                    if conn.status == Connection.Status.REQUESTED:
-                        conn.status = Connection.Status.ESTABLISHED
-                        conn.send_base = header.ack
-                        conn.next_seq_num = header.ack
-                        if 0 in conn.sent_buffer:
-                            del conn.sent_buffer[0]
-                        ack = self._create_segment(Header.Flags.ACK, conn.next_seq_num, conn.recv_base)
-                        self._sock.sendto(ack, address)
-                elif header.flags & Header.Flags.FIN:
-                    conn.status = Connection.Status.CLOSING
+            if header.flags == Messages.CON_REQ:
+                # Duplicate connection request - re-send accept connection message
+                response = self._create_segment(Messages.CON_ACC, seq=100, ack=conn.recv_base)
+                self._sock.sendto(response, address)
 
-            elif header.flags == Header.Flags.ACK:
+            elif header.flags == Messages.CON_ACC:
+                if conn.status == Connection.Status.REQUESTED:
+                    conn.status = Connection.Status.ESTABLISHED
+                    conn.send_base = header.ack
+                    conn.next_seq_num = header.ack
+                    conn.recv_base = (header.seq + 1) % SEQ_SPACE 
+
+                    if 0 in conn.sent_buffer:
+                        del conn.sent_buffer[0]
+                    ack = self._create_segment(Messages.ACK, conn.next_seq_num, conn.recv_base)
+                    self._sock.sendto(ack, address)
+
+            elif header.flags == Messages.CON_CLO:
+                conn.status = Connection.Status.CLOSING_RECEIVED
+                ack = self._create_segment(Messages.CLO_ACK, seq=100, ack=header.seq+1)
+                self._sock.sendto(ack, address)
+
+            elif header.flags == Messages.CLO_ACK:
+                conn.status = Connection.Status.CLOSING_INIT_2
+
+            elif header.flags == Messages.FIN:
+                if conn.status == Connection.Status.CLOSING_INIT_2:
+                    conn.status = Connection.Status.CLOSING_TIMED_WAIT
+
+            elif header.flags == Messages.ACK:
+                if conn.status == Connection.Status.CLOSING_LAST_ACK and header.flags == Messages.FIN_ACK:
+                    del self.connections[address]
+                    return None
+
                 conn.rwnd = header.rec 
                 ack_num = header.ack
                 
@@ -244,9 +284,15 @@ class PRTP_socket:
                 # If distance from send_base to ack_num is positive and small
                 diff = self._seq_diff(ack_num, conn.send_base)
                 if diff > 0 and diff < SEQ_SPACE / 2: # Valid new ACK
-                    print(f"ACK {ack_num} received. Sliding window.")
-                    conn.cwnd += MSS * (MSS / conn.cwnd) if conn.cwnd > 0 else MSS
+                    conn.update_timeout()
                     conn.dup_acks = 0
+
+                    print(f"ACK {ack_num} received. Sliding window.")
+
+                    if conn.in_slow_start:
+                        conn.cwnd += MSS if conn.cwnd > 0 else MSS
+                    else:
+                        conn.cwnd += MSS * (MSS / conn.cwnd) if conn.cwnd > 0 else MSS
 
                     # Slide window
                     # Remove everything 'behind' ack_num in the circular buffer
@@ -268,11 +314,12 @@ class PRTP_socket:
                         print(f"Triple duplicate ACK for {ack_num}. Fast Retransmit!")
                         if conn.send_base in conn.sent_buffer:
                             self._sock.sendto(conn.sent_buffer[conn.send_base]['seg'], address)
-                        conn.ssthresh = max(conn.cwnd // 2, 2 * MSS)
-                        conn.cwnd = conn.ssthresh + 3 * MSS
+
+                        conn.in_slow_start = False
+                        conn.cwnd = max(MSS, conn.cwnd // 2)
 
                 if conn.status == Connection.Status.RECEIVED:
-                        conn.status = Connection.Status.ESTABLISHED
+                    conn.status = Connection.Status.ESTABLISHED
 
             elif not header.flags: # Data
                 seq_num = header.seq
@@ -295,26 +342,28 @@ class PRTP_socket:
                         conn.recv_base = (conn.recv_base + len(data)) % SEQ_SPACE
                         # Send Window Update ACK immediately if buffer cleared?
                         
-                    ack_pkt = self._create_segment(Header.Flags.ACK, 0, conn.recv_base, my_rwnd)
+                    ack_pkt = self._create_segment(Messages.ACK, 0, conn.recv_base, my_rwnd)
                     self._sock.sendto(ack_pkt, address)
                     receive_address = address
                 else:
                     # Re-send ACK for current base
-                    ack_pkt = self._create_segment(Header.Flags.ACK, 0, conn.recv_base, my_rwnd)
+                    ack_pkt = self._create_segment(Messages.ACK, 0, conn.recv_base, my_rwnd)
                     self._sock.sendto(ack_pkt, address)
             
-            if conn.status == Connection.Status.CLOSING and not conn.messages:
-                del self.connections[address]
-            
-            return receive_address
         else:
-            if header.flags == Header.Flags.CON and self._compare_checksum(header, payload):
+            if header.flags == Messages.CON_REQ and self._compare_checksum(header, payload):
                 conn = Connection(Connection.Status.RECEIVED)
                 conn.recv_base = (header.seq + 1) % SEQ_SPACE
+                
+                conn.send_base = 100
+                conn.next_seq_num = 101 # 100 + 1 for SYN (implied)
+                
                 self.connections[address] = conn 
-                response = self._create_segment(Header.Flags.CON | Header.Flags.ACK, seq=100, ack=conn.recv_base)
+                response = self._create_segment(Messages.CON_ACC, seq=100, ack=conn.recv_base)
                 self._sock.sendto(response, address)
                 return None
+            
+        return receive_address
     
     def _seq_diff(self, a, b):
         """Returns the distance from b to a (a - b) in a circular space"""
@@ -330,11 +379,13 @@ class PRTP_socket:
             if current_time - entry['time'] > conn.timeout:
                 print(f"{time.ctime()} - Timeout detected for Seq {conn.send_base}. Retransmitting...")
                 self._sock.sendto(entry['seg'], address)
+                
                 entry['time'] = current_time 
+                entry['retransmitted'] = True
                 
                 # Congestion Control: Collapse CWND on timeout
-                conn.ssthresh = max(conn.cwnd // 2, 2 * MSS)
-                conn.cwnd = MSS
+                conn.in_slow_start = False
+                conn.cwnd = max(MSS, conn.cwnd // 2)
                 conn.dup_acks = 0
 
     def _calculate_checksum(self, header, payload=None):
@@ -360,27 +411,37 @@ class PRTP_socket:
         return calc == header.check
     
     def connect(self, address):
-        """
-            Request a PRTP connection with the host at the provided address.
-            This method should be called externally as part of a running client
-            or server.
-        """
-        if address in self.connections: return False
-        
-        print(f"{time.ctime()} - Connecting to {address}...")
-        self.connections[address] = Connection(Connection.Status.REQUESTED)
-        conn = self.connections[address]
-        
-        segment = self._create_segment(Header.Flags.CON, seq=0)
-        
-        conn.sent_buffer[0] = {
-            'data': b'', 
-            'time': time.time(), 
-            'seg': segment
-        }
+            """
+                Request a PRTP connection with the host at the provided address.
+                This method should be called externally as part of a running client
+                or server.
+            """
+            if address in self.connections: return False
+            
+            print(f"{time.ctime()} - Connecting to {address}...")
+            self.connections[address] = Connection(Connection.Status.REQUESTED)
+            conn = self.connections[address]
+            
+            # Initial CON segment always starts at sequence 0
+            segment = self._create_segment(Header.Flags.CON, seq=0)
+            
+            conn.sent_buffer[0] = {
+                'data': b'', 
+                'time': time.time(), 
+                'seg': segment
+            }
 
-        self._sock.sendto(segment, address)
-        return True
+            self._sock.sendto(segment, address)
+            conn.next_seq_num = (conn.next_seq_num + 1) % SEQ_SPACE
+            
+            start_wait = time.time()
+            while conn.status != Connection.Status.ESTABLISHED:
+                self.receive()
+                if time.time() - start_wait > 5: # Hard timeout for handshake
+                    return False
+                time.sleep(0.01)
+
+            return True
     
     def disconnect(self, address):
         """
@@ -389,9 +450,10 @@ class PRTP_socket:
             or server.
         """
         if address in self.connections:
+            conn = self.connections[address]
+            conn.status = Connection.Status.CLOSING_INIT_1
             segment = self._create_segment(Header.Flags.CON | Header.Flags.FIN)
             self._sock.sendto(segment, address)
-            del self.connections[address]
 
     def send(self, payload, address):
         """
@@ -401,12 +463,13 @@ class PRTP_socket:
             This method should be called externally as part of a running client
             or server.
         """
-        if address not in self.connections: return False
+        if address not in self.connections or self.connections[address].status == Connection.Status.CLOSING_INIT_1: return False
         conn = self.connections[address]
         
         data_chunks = [payload[i:i+MSS] for i in range(0, len(payload), MSS)]
         total_chunks = len(data_chunks)
         sent_count = 0
+        last_probe = time.time() # For Zero Window Probing
         
         print(f"Sending {len(payload)} bytes in {total_chunks} chunks.")
 
@@ -434,10 +497,15 @@ class PRTP_socket:
                 conn.next_seq_num = (conn.next_seq_num + len(chunk)) % SEQ_SPACE
                 sent_count += 1
             
+            elif window_limit == 0 and time.time() - last_probe > conn.timeout:
+                probe = self._create_segment(seq=conn.next_seq_num, ack=conn.recv_base)
+                self._sock.sendto(probe, address)
+                last_probe = time.time()
+
             if sent_count == total_chunks and not conn.sent_buffer:
                 break
-
-            time.sleep(0.001)
+            
+            time.sleep(0) 
                 
         return True
 
@@ -448,8 +516,14 @@ class PRTP_socket:
             useful message is received, this function returns the from address
             for that message, which can be used with get_message()
         """
+        conn_del = []
         for addr, conn in list(self.connections.items()):
+            if conn.status == Connection.Status.CLOSING_TIMED_WAIT:
+                if time.time() - conn.close_timer >= conn.MAX_SEGMENT_LIFETIME:
+                    conn_del.append(address)
             self.check_timers(conn, addr)
+        for address in conn_del:
+            del self.connections[address]
 
         try:
             while True:
@@ -461,18 +535,21 @@ class PRTP_socket:
         return None
         
     def get_segment(self, address):
-        """
-            Gets the first incoming message in the queue for the provided
-            address as long as there is an active connection with it.
-        """
         if address in self.connections and (conn := self.connections[address]).messages:
+            # Check if window was effectively closed before we consume data
+            was_full = (MAX_BUFFER_SIZE - (sum(len(m) for m in conn.messages))) < MSS
+            
             message = conn.messages.popleft()
-            if conn.status == Connection.Status.CLOSING and not conn.messages:
-                # Terminate closing connection on empty message queue
-                del self.connections[address]
+            
+            if was_full:
+                current_buffer_usage = sum(len(m) for m in conn.messages) + len(conn.recv_buffer) * MSS
+                new_rwnd = max(0, MAX_BUFFER_SIZE - current_buffer_usage)
+                # Send Window Update
+                update = self._create_segment(Header.Flags.ACK, 0, conn.recv_base, new_rwnd)
+                self._sock.sendto(update, address)
+                
             return message
-        else: 
-            return None
+        return None
 
 class PRTP_server:
     def __init__(self, ip, port):
