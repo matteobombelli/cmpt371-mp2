@@ -253,6 +253,8 @@ class PRTP_socket:
                     conn.status = Connection.Status.ESTABLISHED
                     conn.send_base = header.ack
                     conn.next_seq_num = header.ack
+                    conn.recv_base = (header.seq + 1) % SEQ_SPACE 
+
                     if 0 in conn.sent_buffer:
                         del conn.sent_buffer[0]
                     ack = self._create_segment(Messages.ACK, conn.next_seq_num, conn.recv_base)
@@ -352,6 +354,10 @@ class PRTP_socket:
             if header.flags == Messages.CON_REQ and self._compare_checksum(header, payload):
                 conn = Connection(Connection.Status.RECEIVED)
                 conn.recv_base = (header.seq + 1) % SEQ_SPACE
+                
+                conn.send_base = 100
+                conn.next_seq_num = 101 # 100 + 1 for SYN (implied)
+                
                 self.connections[address] = conn 
                 response = self._create_segment(Messages.CON_ACC, seq=100, ack=conn.recv_base)
                 self._sock.sendto(response, address)
@@ -426,9 +432,15 @@ class PRTP_socket:
             }
 
             self._sock.sendto(segment, address)
-            
             conn.next_seq_num = (conn.next_seq_num + 1) % SEQ_SPACE
             
+            start_wait = time.time()
+            while conn.status != Connection.Status.ESTABLISHED:
+                self.receive()
+                if time.time() - start_wait > 5: # Hard timeout for handshake
+                    return False
+                time.sleep(0.01)
+
             return True
     
     def disconnect(self, address):
@@ -457,6 +469,7 @@ class PRTP_socket:
         data_chunks = [payload[i:i+MSS] for i in range(0, len(payload), MSS)]
         total_chunks = len(data_chunks)
         sent_count = 0
+        last_probe = time.time() # For Zero Window Probing
         
         print(f"Sending {len(payload)} bytes in {total_chunks} chunks.")
 
@@ -484,10 +497,15 @@ class PRTP_socket:
                 conn.next_seq_num = (conn.next_seq_num + len(chunk)) % SEQ_SPACE
                 sent_count += 1
             
+            elif window_limit == 0 and time.time() - last_probe > conn.timeout:
+                probe = self._create_segment(seq=conn.next_seq_num, ack=conn.recv_base)
+                self._sock.sendto(probe, address)
+                last_probe = time.time()
+
             if sent_count == total_chunks and not conn.sent_buffer:
                 break
-
-            time.sleep(0.001)
+            
+            time.sleep(0) 
                 
         return True
 
