@@ -3,9 +3,9 @@ from enum import Enum, auto
 from collections import deque
 import time
 
-PRTP_MAX_SEGMENT_SIZE = 2**16 # 16 bit segment size space for byte alignment
+PRTP_MAX_SEGMENT_SIZE = (2**16) - 1 # 16 bit segment size space for byte alignment
 MSS = 1024
-MAX_BUFFER_SIZE = 64 * 1024
+MAX_BUFFER_SIZE = (2**16) - 1
 SEQ_SPACE = 2**16
 
 class Connection:
