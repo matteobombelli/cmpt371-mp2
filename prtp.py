@@ -3,9 +3,9 @@ from enum import Enum, auto
 from collections import deque
 import time
 
-PRTP_MAX_SEGMENT_SIZE = 2**16 # 16 bit segment size space for byte alignment
+PRTP_MAX_SEGMENT_SIZE = (2**16) - 1 # 16 bit segment size space for byte alignment
 MSS = 1024
-MAX_BUFFER_SIZE = 64 * 1024
+MAX_BUFFER_SIZE = (2**16) - 1
 SEQ_SPACE = 2**16
 
 class Connection:
@@ -224,7 +224,10 @@ class PRTP_socket:
                  conn.update_timeout()
 
             if header.flags & Header.Flags.CON:
-                if header.flags & Header.Flags.ACK:
+                if header.flags == Header.Flags.CON:
+                    response = self._create_segment(Header.Flags.CON | Header.Flags.ACK, seq=100, ack=conn.recv_base)
+                    self._sock.sendto(response, address)
+                elif header.flags & Header.Flags.ACK:
                     if conn.status == Connection.Status.REQUESTED:
                         conn.status = Connection.Status.ESTABLISHED
                         conn.send_base = header.ack
