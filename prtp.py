@@ -20,7 +20,7 @@ class Connection:
         CLOSING_RECEIVED = auto()
         CLOSING_LAST_ACK = auto()
 
-    MAX_SEGMENT_LIFETIME = 60 # 60 second lifetime.
+    MAX_SEGMENT_LIFETIME = 0.001 # 60 second lifetime.
 
     def __init__(self, status=Status.REQUESTED):
         self.status = status

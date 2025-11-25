@@ -16,7 +16,6 @@ from prtp import PRTP_client, PRTP_server, Connection, MSS
 # However, the 16-bit header field 'Rec' can only hold up to 65535.
 # This causes an OverflowError when the buffer is empty.
 # We patch it here to 65535 to allow tests to run without modifying your source.
-prtp.MAX_BUFFER_SIZE = 65535
 # =========================================================================
 
 # Configure Logging
