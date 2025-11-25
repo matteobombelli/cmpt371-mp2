@@ -20,7 +20,7 @@ class Connection:
         CLOSING_RECEIVED = auto()
         CLOSING_LAST_ACK = auto()
 
-    MAX_SEGMENT_LIFETIME = 3 # 60 second lifetime.
+    MAX_SEGMENT_LIFETIME = 0.001 # 60 second lifetime.
 
     def __init__(self, status=Status.REQUESTED):
         self.status = status
@@ -37,6 +37,7 @@ class Connection:
         self.send_base = 0
         self.next_seq_num = 0
         self.recv_base = 0
+        self.zero_probe_timer = time.time()
 
         # Flow Control
         self.rwnd = MAX_BUFFER_SIZE
@@ -246,7 +247,7 @@ class PRTP_socket:
         (header, payload) = self._decompose_segment(segment)
         receive_address = None
 
-        print(f"{time.ctime()} - {self.address}: Receiving data from {address}...")
+        print(f"{time.ctime()} - {self.address}: Receiving {len(segment)} bytes from {address}...")
         
         if address in self.connections:
             conn = self.connections[address]
@@ -256,7 +257,7 @@ class PRTP_socket:
 
             if header.flags == Messages.CON_REQ:
                 # Duplicate connection request - re-send accept connection message
-                print(f"{time.time()} - {self.address}: Duplicate connection request received from {address}...")
+                print(f"{time.ctime()} - {self.address}: Duplicate connection request received from {address}...")
                 response = self._create_segment(Messages.CON_ACC, seq=100, ack=conn.recv_base)
                 self._sock.sendto(response, address)
 
@@ -292,6 +293,7 @@ class PRTP_socket:
                     conn.close_timer = time.time()
 
             elif header.flags == Messages.ACK:
+                self.zero_probe_timer = time.time()
                 if conn.status == Connection.Status.CLOSING_LAST_ACK and header.flags == Messages.FIN_ACK:
                     del self.connections[address]
                     return None
@@ -371,7 +373,7 @@ class PRTP_socket:
             
         else:
             if header.flags == Messages.CON_REQ and self._compare_checksum(header, payload):
-                print(f"{time.time()} - {self.address}: Connection request received from {address}...")
+                print(f"{time.ctime()} - {self.address}: Connection request received from {address}...")
                 conn = Connection(Connection.Status.RECEIVED)
                 conn.recv_base = (header.seq + 1) % SEQ_SPACE
                 
@@ -439,22 +441,38 @@ class PRTP_socket:
                 self.check_timers(conn, address)
                 if conn.out_q:
                     window_limit = min(conn.cwnd, conn.rwnd)
-                    
                     in_flight = self._seq_diff(conn.next_seq_num, conn.send_base)
-                    
-                    if in_flight+MSS <= window_limit:
-                        chunk = conn.out_q.popleft()
-                        seq_num = conn.next_seq_num
-                        segment = self._create_segment(flags=0, seq=seq_num, ack=conn.recv_base, payload=chunk)
-                        conn.sent_buffer[seq_num] = {
-                            'data': chunk, 
-                            'time': time.time(), 
-                            'seg': segment,
-                            'retransmitted': False
-                        }
-                        self._sock.sendto(segment, address)
-                        conn.next_seq_num = (conn.next_seq_num + len(chunk)) % SEQ_SPACE
+                    available_window = max(0, window_limit-in_flight)
 
+                    if not available_window and time.time()-self.zero_probe_timer > 5:
+                        # Probe for available window
+                        probe = self._create_segment(Messages.ACK, seq=(conn.next_seq-1)%SEQ_SPACE, ack=conn.recv_base)
+                        self.sock.sendto(probe, address)
+                        self.zero_probe_timer = time.time()
+
+                    # Send next chunk
+                    chunk = conn.out_q[0]
+                    max_bytes = min(len(chunk), available_window)
+                    payload = chunk
+                    if available_window <= 0:
+                        pass
+                    elif max_bytes < len(chunk):
+                        # Cannot send chunk
+                        payload = chunk[:max_bytes]
+                        remainder = chunk[max_bytes:]
+                        conn.out_q[0] = remainder
+                    seq_num = conn.next_seq_num
+                    segment = self._create_segment(flags=0, seq=seq_num, ack=conn.recv_base, payload=payload)
+                    conn.sent_buffer[seq_num] = {
+                        'data': payload, 
+                        'time': time.time(), 
+                        'seg': segment,
+                        'retransmitted': False
+                    }
+                    self._sock.sendto(segment, address)
+                    conn.next_seq_num = (conn.next_seq_num + len(payload)) % SEQ_SPACE
+                    self.zero_probe_timer = time.time()
+                        
     def _receive(self):
         """
             Receive incoming segments from the socket. This method should be
@@ -467,7 +485,7 @@ class PRTP_socket:
             if conn.status == Connection.Status.CLOSING_TIMED_WAIT:
                 # print(f"time:{time.time()}, timer:{conn.close_timer}, diff:{time.time() - conn.close_timer}, max_life:{conn.MAX_SEGMENT_LIFETIME}")
                 if time.time() - conn.close_timer >= 2 * conn.MAX_SEGMENT_LIFETIME:
-                    conn_del.append(address)
+                    conn_del.append(addr)
             self.check_timers(conn, addr)
         try:
             (segment, address) = self._sock.recvfrom(PRTP_MAX_SEGMENT_SIZE)
@@ -525,11 +543,9 @@ class PRTP_socket:
             
             start_wait = time.time()
             while conn.status != Connection.Status.ESTABLISHED:
-                self.receive()
                 if time.time() - start_wait > 5: # Hard timeout for handshake
                     return False
                 time.sleep(0.01)
-
             return True
     
     def disconnect(self, address):
@@ -550,23 +566,28 @@ class PRTP_socket:
 
             data_chunks = [payload[i:i+MSS] for i in range(0, len(payload), MSS)]
             total_chunks = len(data_chunks)
-            last_probe = time.time() # For Zero Window Probing
             
             print(f"Sending {len(payload)} bytes in {total_chunks} chunks.")
 
             for chunk in data_chunks:
+                while len(chunk)+self._seq_diff(conn.next_seq_num, conn.send_base) >= MAX_BUFFER_SIZE:
+                    # Wait for queue to empty
+                    time.sleep(0.001)
                 conn.out_q.append(chunk)
+
             return True
         else:
             return False
 
     def recvfrom(self, address):
         if address in self.connections and (conn := self.connections[address]).messages:
+
             # Check if window was effectively closed before we consume data
             was_full = (MAX_BUFFER_SIZE - (sum(len(m) for m in conn.messages))) < MSS
             
             message = conn.messages.popleft()
-            
+            print(f"{time.ctime()} - {self.address}: Receiving payload of {len(message)} bytes from {address}...")            
+
             if was_full:
                 current_buffer_usage = sum(len(m) for m in conn.messages) + len(conn.recv_buffer) * MSS
                 new_rwnd = max(0, MAX_BUFFER_SIZE - current_buffer_usage)
