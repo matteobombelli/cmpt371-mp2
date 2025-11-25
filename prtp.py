@@ -20,7 +20,7 @@ class Connection:
         CLOSING_RECEIVED = auto()
         CLOSING_LAST_ACK = auto()
 
-    MAX_SEGMENT_LIFETIME = 0.001 # 60 second lifetime.
+    MAX_SEGMENT_LIFETIME = 60 # 60 second lifetime.
 
     def __init__(self, status=Status.REQUESTED):
         self.status = status
@@ -49,7 +49,6 @@ class Connection:
 
         # Buffers
         self.sent_buffer = {}
-        self.recv_buffer = {}
         self.out_q = deque()
 
     def update_timeout(self):
@@ -316,12 +315,11 @@ class PRTP_socket:
                         conn.cwnd += MSS * (MSS / conn.cwnd) if conn.cwnd > 0 else MSS
 
                     # Slide window
-                    # Remove everything 'behind' ack_num in the circular buffer
                     keys_to_remove = []
                     for seq in list(conn.sent_buffer.keys()):
                         # If seq is "before" ack_num in circular arithmetic
                         # dist(ack, seq) is small (meaning seq is just behind ack)
-                        if self._seq_diff(ack_num, seq) < SEQ_SPACE / 2 and seq != ack_num:
+                        if self._seq_diff(ack_num, seq) < SEQ_SPACE // 2 and seq != ack_num:
                             keys_to_remove.append(seq)
                     
                     for k in keys_to_remove:
@@ -333,11 +331,11 @@ class PRTP_socket:
                     conn.dup_acks += 1
                     if conn.dup_acks == 3:
                         print(f"Triple duplicate ACK for {ack_num}. Fast Retransmit!")
-                        if conn.send_base in conn.sent_buffer:
-                            self._sock.sendto(conn.sent_buffer[conn.send_base]['seg'], address)
+                        for entry in conn.sent_buffer.values():
+                            self._sock.sendto(entry['seg'], address)
 
-                        conn.in_slow_start = False
-                        conn.cwnd = max(MSS, conn.cwnd // 2)
+                    conn.in_slow_start = False
+                    conn.cwnd = max(MSS, conn.cwnd // 2)
 
                 if conn.status == Connection.Status.RECEIVED:
                     conn.status = Connection.Status.ESTABLISHED
@@ -346,28 +344,21 @@ class PRTP_socket:
                 seq_num = header.seq
                 
                 # Flow Control Calc
-                current_buffer_usage = sum(len(m) for m in conn.messages) + len(conn.recv_buffer) * MSS
+                current_buffer_usage = sum(len(m) for m in conn.messages)
                 my_rwnd = max(0, MAX_BUFFER_SIZE - current_buffer_usage)
 
-                # Accept if seq is within [recv_base, recv_base + Window)
-                dist = self._seq_diff(seq_num, conn.recv_base)
-                
-                if dist < MAX_BUFFER_SIZE and current_buffer_usage < MAX_BUFFER_SIZE:
-                    conn.recv_buffer[seq_num] = payload
+                if seq_num == conn.recv_base and current_buffer_usage < MAX_BUFFER_SIZE:
                     
-                    # Deliver
-                    while conn.recv_base in conn.recv_buffer:
-                        data = conn.recv_buffer[conn.recv_base]
-                        conn.messages.append(data)
-                        del conn.recv_buffer[conn.recv_base]
-                        conn.recv_base = (conn.recv_base + len(data)) % SEQ_SPACE
-                        # Send Window Update ACK immediately if buffer cleared?
-                        
+                    # Deliver immediately (No buffering out-of-order)
+                    conn.messages.append(payload)
+                    conn.recv_base = (conn.recv_base + len(payload)) % SEQ_SPACE
+                    
+                    # Send ACK for NEW base
                     ack_pkt = self._create_segment(Messages.ACK, 0, conn.recv_base, my_rwnd)
                     self._sock.sendto(ack_pkt, address)
                     receive_address = address
                 else:
-                    # Re-send ACK for current base
+                    print(f"Out of order {seq_num} (wanted {conn.recv_base}). Discarding.")
                     ack_pkt = self._create_segment(Messages.ACK, 0, conn.recv_base, my_rwnd)
                     self._sock.sendto(ack_pkt, address)
             
@@ -399,15 +390,17 @@ class PRTP_socket:
         if conn.send_base in conn.sent_buffer:
             entry = conn.sent_buffer[conn.send_base]
             if current_time - entry['time'] > conn.timeout:
-                print(f"{time.ctime()} - Timeout detected for Seq {conn.send_base}. Retransmitting...")
-                self._sock.sendto(entry['seg'], address)
-                
+                print(f"{time.ctime()} - Timeout detected for Seq {conn.send_base}. GBN Retransmitting Window...")
+                # retransmit all packets in the sent_buffer
+                for _, packet_entry in conn.sent_buffer.items():
+                    self._sock.sendto(packet_entry['seg'], address)
+                    packet_entry['retransmitted'] = True
+
                 entry['time'] = current_time 
-                entry['retransmitted'] = True
                 
                 # Congestion Control: Collapse CWND on timeout
-                conn.in_slow_start = False
-                conn.cwnd = max(MSS, conn.cwnd // 2)
+                conn.ssthresh = max(conn.cwnd // 2, 2 * MSS)
+                conn.cwnd = MSS
                 conn.dup_acks = 0
 
     def _calculate_checksum(self, header, payload=None):
@@ -447,20 +440,20 @@ class PRTP_socket:
                     if not available_window and time.time()-self.zero_probe_timer > 5:
                         # Probe for available window
                         probe = self._create_segment(Messages.ACK, seq=(conn.next_seq-1)%SEQ_SPACE, ack=conn.recv_base)
-                        self.sock.sendto(probe, address)
+                        self._sock.sendto(probe, address)
                         self.zero_probe_timer = time.time()
 
                     # Send next chunk
-                    chunk = conn.out_q[0]
+                    chunk = conn.out_q.popleft()
                     max_bytes = min(len(chunk), available_window)
                     payload = chunk
                     if available_window <= 0:
                         pass
                     elif max_bytes < len(chunk):
-                        # Cannot send chunk
+                        # Cannot send full chunk
                         payload = chunk[:max_bytes]
                         remainder = chunk[max_bytes:]
-                        conn.out_q[0] = remainder
+                        conn.out_q.appendleft(remainder)
                     seq_num = conn.next_seq_num
                     segment = self._create_segment(flags=0, seq=seq_num, ack=conn.recv_base, payload=payload)
                     conn.sent_buffer[seq_num] = {
@@ -570,7 +563,7 @@ class PRTP_socket:
             print(f"Sending {len(payload)} bytes in {total_chunks} chunks.")
 
             for chunk in data_chunks:
-                while len(chunk)+self._seq_diff(conn.next_seq_num, conn.send_base) >= MAX_BUFFER_SIZE:
+                while len(chunk) + sum(len(x) for x in conn.out_q) + self._seq_diff(conn.next_seq_num, conn.send_base) >= MAX_BUFFER_SIZE:
                     # Wait for queue to empty
                     time.sleep(0.001)
                 conn.out_q.append(chunk)
@@ -589,7 +582,7 @@ class PRTP_socket:
             print(f"{time.ctime()} - {self.address}: Receiving payload of {len(message)} bytes from {address}...")            
 
             if was_full:
-                current_buffer_usage = sum(len(m) for m in conn.messages) + len(conn.recv_buffer) * MSS
+                current_buffer_usage = sum(len(m) for m in conn.messages)
                 new_rwnd = max(0, MAX_BUFFER_SIZE - current_buffer_usage)
                 # Send Window Update
                 update = self._create_segment(Header.Flags.ACK, 0, conn.recv_base, new_rwnd)
