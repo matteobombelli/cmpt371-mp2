@@ -20,11 +20,12 @@ class Connection:
         CLOSING_RECEIVED = auto()
         CLOSING_LAST_ACK = auto()
 
-    MAX_SEGMENT_LIFETIME = 0.001 # 60 second lifetime.
+    MAX_SEGMENT_LIFETIME = 1 # 60 second lifetime.
 
     def __init__(self, status=Status.REQUESTED):
         self.status = status
         self.messages = deque()
+        self.message_lock = threading.Lock()
         self.last_time = time.time()
         self.close_timer = 0
 
@@ -352,7 +353,9 @@ class PRTP_socket:
                 if seq_num == conn.recv_base and current_buffer_usage < MAX_BUFFER_SIZE:
                     
                     # Deliver immediately (No buffering out-of-order)
+                    conn.message_lock.acquire(True)
                     conn.messages.append(payload)
+                    conn.message_lock.release()
                     conn.recv_base = (conn.recv_base + len(payload)) % SEQ_SPACE
                     
                     # Send ACK for NEW base
@@ -534,6 +537,10 @@ class PRTP_socket:
             segment = self._create_segment(Header.Flags.CON | Header.Flags.FIN)
             self._sock.sendto(segment, address)
 
+        then = time.time()
+        while address in self.connections and time.time() - then < 5:
+            time.sleep(0.1)
+
     def sendto(self, payload, address):
         if address in self.connections:
             conn = self.connections[address]
@@ -559,7 +566,10 @@ class PRTP_socket:
             # Check if window was effectively closed before we consume data
             was_full = (MAX_BUFFER_SIZE - (sum(len(m) for m in conn.messages))) < MSS
             
+            conn.message_lock.acquire(True)
             message = conn.messages.popleft()
+            conn.message_lock.release()
+
             print(f"{time.ctime()} - {self.address}: Receiving payload of {len(message)} bytes from {address}...")            
 
             if was_full:
