@@ -308,14 +308,13 @@ class PRTP_socket:
                 diff = self._seq_diff(ack_num, conn.send_base)
                 if diff > 0 and diff < SEQ_SPACE // 2: # Valid new ACK
                     conn.update_timeout()
-                    conn.dup_acks = 0
 
                     print(f"ACK {ack_num} received. Sliding window.")
 
                     if conn.in_slow_start:
                         conn.cwnd += MSS if conn.cwnd > 0 else MSS
                     else:
-                        conn.cwnd += MSS * (MSS // conn.cwnd) if conn.cwnd > 0 else MSS
+                        conn.cwnd += int(MSS * (MSS / conn.cwnd)) if conn.cwnd > 0 else MSS
 
                     # Slide window
                     keys_to_remove = []
@@ -331,12 +330,6 @@ class PRTP_socket:
                     conn.send_base = ack_num
                         
                 elif ack_num == conn.send_base:
-                    conn.dup_acks += 1
-                    if conn.dup_acks == 3:
-                        print(f"Triple duplicate ACK for {ack_num}. Fast Retransmit!")
-                        for entry in conn.sent_buffer.values():
-                            self._sock.sendto(entry['seg'], address)
-
                     conn.in_slow_start = False
                     conn.cwnd = max(MSS, conn.cwnd // 2)
 
@@ -403,9 +396,9 @@ class PRTP_socket:
                     packet_entry['time'] = current_time
                 
                 # Congestion Control: Collapse CWND on timeout
-                conn.ssthresh = max(conn.cwnd // 2, 2 * MSS)
-                conn.cwnd = MSS
-                conn.dup_acks = 0
+                
+                conn.in_slow_start = False
+                conn.cwnd = max(MSS, conn.cwnd // 2)
 
     def _calculate_checksum(self, header, payload=None):
         """
