@@ -242,7 +242,7 @@ class TestPRTP(unittest.TestCase):
             full_sent_data += chunk
             
         # Wait for retransmissions to settle
-        time.sleep(5) 
+        time.sleep(15) 
         
         received_bytes = b"".join(self.server_received_data)
         
@@ -281,6 +281,28 @@ class TestPRTP(unittest.TestCase):
         self.assertEqual(received_bytes, test_msg, 
                          "Corruption Test Failed: Received data does not match sent data")
         logger.info("PASS: Corrupted packets were rejected and retransmitted.")
+
+    def test_05_expect_good(self):
+        self.client.sock.connect((SERVER_IP, SERVER_PORT))
+        
+        # Establish connection loop
+        for _ in range(50):
+            if (SERVER_IP, SERVER_PORT) in self.client.sock.connections:
+                 if self.client.sock.connections[(SERVER_IP, SERVER_PORT)].status == Connection.Status.ESTABLISHED:
+                     break
+            time.sleep(0.1)
+
+        test_msg = b"THIS_IS_GOOD" * 10
+        self.client.sock.sendto(test_msg, (SERVER_IP, SERVER_PORT))
+        
+        time.sleep(6) # Wait for retransmissions
+        
+        received_bytes = b"".join(self.server_received_data)
+        
+        self.assertEqual(received_bytes, test_msg, 
+                         "Good Test Failed: Didnt receive everything!")
+        logger.info("PASS: Everything went fine!.")
+        self.client.sock.disconnect((SERVER_IP, SERVER_PORT))
 
 if __name__ == '__main__':
     unittest.main()

@@ -290,6 +290,8 @@ class PRTP_socket:
                 if conn.status == Connection.Status.CLOSING_INIT_2:
                     conn.status = Connection.Status.CLOSING_TIMED_WAIT
                     conn.close_timer = time.time()
+                fin_ack = self._create_segment(Messages.FIN_ACK, seq=conn.next_seq_num, ack=header.seq+1)
+                self._sock.sendto(fin_ack, address)
 
             elif header.flags == Messages.ACK:
                 self.zero_probe_timer = time.time()
@@ -303,7 +305,7 @@ class PRTP_socket:
                 # Check if ACK moves window forward
                 # If distance from send_base to ack_num is positive and small
                 diff = self._seq_diff(ack_num, conn.send_base)
-                if diff > 0 and diff < SEQ_SPACE / 2: # Valid new ACK
+                if diff > 0 and diff < SEQ_SPACE // 2: # Valid new ACK
                     conn.update_timeout()
                     conn.dup_acks = 0
 
@@ -312,7 +314,7 @@ class PRTP_socket:
                     if conn.in_slow_start:
                         conn.cwnd += MSS if conn.cwnd > 0 else MSS
                     else:
-                        conn.cwnd += MSS * (MSS / conn.cwnd) if conn.cwnd > 0 else MSS
+                        conn.cwnd += MSS * (MSS // conn.cwnd) if conn.cwnd > 0 else MSS
 
                     # Slide window
                     keys_to_remove = []
@@ -395,8 +397,7 @@ class PRTP_socket:
                 for _, packet_entry in conn.sent_buffer.items():
                     self._sock.sendto(packet_entry['seg'], address)
                     packet_entry['retransmitted'] = True
-
-                entry['time'] = current_time 
+                    packet_entry['time'] = current_time
                 
                 # Congestion Control: Collapse CWND on timeout
                 conn.ssthresh = max(conn.cwnd // 2, 2 * MSS)
@@ -488,26 +489,6 @@ class PRTP_socket:
 
         for address in conn_del:
             del self.connections[address]
-
-    # PRTP Socket Public Methods ##############################################
-    def check_timers(self, conn, address):
-        if not conn.sent_buffer: return
-
-        current_time = time.time()
-        # Check oldest unacked
-        if conn.send_base in conn.sent_buffer:
-            entry = conn.sent_buffer[conn.send_base]
-            if current_time - entry['time'] > conn.timeout:
-                print(f"{time.ctime()} - Timeout detected for Seq {conn.send_base}. Retransmitting...")
-                self._sock.sendto(entry['seg'], address)
-                
-                entry['time'] = current_time 
-                entry['retransmitted'] = True
-                
-                # Congestion Control: Collapse CWND on timeout
-                conn.ssthresh = max(conn.cwnd // 2, 2 * MSS)
-                conn.cwnd = MSS
-                conn.dup_acks = 0
 
     def connect(self, address):
             """
