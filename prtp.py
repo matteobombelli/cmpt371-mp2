@@ -7,9 +7,25 @@ import time
 PRTP_MAX_SEGMENT_SIZE = (2**16) - 1 # 16 bit segment size space for byte alignment
 MSS = 1024
 SEQ_SPACE = 2**16
-MAX_BUFFER_SIZE = SEQ_SPACE // 2
+MAX_BUFFER_SIZE = (SEQ_SPACE // 2)
 
 class Connection:
+    """
+        This PRTP Connection class holds all relevant information for a PRTP connection.
+        This includes receiver and sender pipeline windows
+
+        Receiver window:
+        [pk1, pk2, ..., pkn]
+          |
+        recv_base
+
+        Sender window:
+        [pk1, pk2, ..., pkn]
+          |
+        send_base
+
+
+    """
     class Status(Enum):
         REQUESTED = auto()
         RECEIVED = auto()
@@ -245,7 +261,6 @@ class PRTP_socket:
             passes checksum matching).
         """
         (header, payload) = self._decompose_segment(segment)
-        receive_address = None
 
         print(f"{time.ctime()} - {self.address}: Receiving {len(segment)} bytes from {address}...")
         
@@ -331,6 +346,7 @@ class PRTP_socket:
                         
                 elif ack_num == conn.send_base:
                     conn.dup_acks += 1
+                    print(f"{time.ctime()} - {self.address}: Re-ack received... send_base=={conn.send_base}... conn.dup_acks:{conn.dup_acks}")
                     if conn.dup_acks == 3:
                         print(f"Triple duplicate ACK for {ack_num}. Fast Retransmit!")
                         if conn.send_base in conn.sent_buffer:
@@ -338,6 +354,7 @@ class PRTP_socket:
 
                         conn.in_slow_start = False
                         conn.cwnd = max(MSS, conn.cwnd // 2)
+                        conn.dup_acks = 0
 
                 if conn.status == Connection.Status.RECEIVED:
                     conn.status = Connection.Status.ESTABLISHED
@@ -346,13 +363,16 @@ class PRTP_socket:
                 seq_num = header.seq
                 
                 # Flow Control Calc
-                current_buffer_usage = sum(len(m) for m in conn.messages) + len(conn.recv_buffer) * MSS
+                recv_buffer_size = sum(len(v) for k,v in conn.recv_buffer.items())
+                message_buffer_size = sum(len(m) for m in conn.messages)
+                current_buffer_usage = message_buffer_size + recv_buffer_size + len(payload)
                 my_rwnd = max(0, MAX_BUFFER_SIZE - current_buffer_usage)
 
                 # Accept if seq is within [recv_base, recv_base + Window)
                 dist = self._seq_diff(seq_num, conn.recv_base)
                 
-                if dist < MAX_BUFFER_SIZE and current_buffer_usage < MAX_BUFFER_SIZE:
+                print(f"dist:{dist}, MBS:{MAX_BUFFER_SIZE}, message_buffer_size:{message_buffer_size}, dist<mbs:{dist < MAX_BUFFER_SIZE}, cbu:{current_buffer_usage}, recv_buffer_size:{recv_buffer_size}, cbu<mbs:{current_buffer_usage < MAX_BUFFER_SIZE}")
+                if dist < MAX_BUFFER_SIZE and current_buffer_usage < MAX_BUFFER_SIZE-1:
                     conn.recv_buffer[seq_num] = payload
                     
                     # Deliver
@@ -365,10 +385,10 @@ class PRTP_socket:
                         
                     ack_pkt = self._create_segment(Messages.ACK, 0, conn.recv_base, my_rwnd)
                     self._sock.sendto(ack_pkt, address)
-                    receive_address = address
                 else:
                     # Re-send ACK for current base
                     ack_pkt = self._create_segment(Messages.ACK, 0, conn.recv_base, my_rwnd)
+                    print(f"{time.ctime()} - {self.address}: Re-ack {conn.recv_base}... sending {len(ack_pkt)} bytes to {address}...")
                     self._sock.sendto(ack_pkt, address)
             
         else:
@@ -383,9 +403,6 @@ class PRTP_socket:
                 self.connections[address] = conn 
                 response = self._create_segment(Messages.CON_ACC, seq=100, ack=conn.recv_base)
                 self._sock.sendto(response, address)
-                return None
-            
-        return receive_address
     
     def _seq_diff(self, a, b):
         """Returns the distance from b to a (a - b) in a circular space"""
@@ -451,7 +468,7 @@ class PRTP_socket:
                         self.zero_probe_timer = time.time()
 
                     # Send next chunk
-                    chunk = conn.out_q[0]
+                    chunk = conn.out_q.popleft()
                     max_bytes = min(len(chunk), available_window)
                     payload = chunk
                     if available_window <= 0:
@@ -460,7 +477,7 @@ class PRTP_socket:
                         # Cannot send chunk
                         payload = chunk[:max_bytes]
                         remainder = chunk[max_bytes:]
-                        conn.out_q[0] = remainder
+                        conn.out_q.appendleft(remainder)
                     seq_num = conn.next_seq_num
                     segment = self._create_segment(flags=0, seq=seq_num, ack=conn.recv_base, payload=payload)
                     conn.sent_buffer[seq_num] = {
@@ -570,7 +587,7 @@ class PRTP_socket:
             print(f"Sending {len(payload)} bytes in {total_chunks} chunks.")
 
             for chunk in data_chunks:
-                while len(chunk)+self._seq_diff(conn.next_seq_num, conn.send_base) >= MAX_BUFFER_SIZE:
+                while sum(len(x) for x in conn.out_q)+len(chunk)+self._seq_diff(conn.next_seq_num, conn.send_base) >= MAX_BUFFER_SIZE:
                     # Wait for queue to empty
                     time.sleep(0.001)
                 conn.out_q.append(chunk)

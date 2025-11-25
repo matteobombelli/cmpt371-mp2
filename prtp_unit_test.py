@@ -9,16 +9,6 @@ import prtp # Importing the module object to monkey-patch variables
 # Import your protocol implementation
 from prtp import PRTP_client, PRTP_server, Connection, MSS
 
-# =========================================================================
-# MONKEY PATCH FIX FOR CODE BUG
-# =========================================================================
-# Your code sets MAX_BUFFER_SIZE to 65536 (2^16).
-# However, the 16-bit header field 'Rec' can only hold up to 65535.
-# This causes an OverflowError when the buffer is empty.
-# We patch it here to 65535 to allow tests to run without modifying your source.
-prtp.MAX_BUFFER_SIZE = 65535
-# =========================================================================
-
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
